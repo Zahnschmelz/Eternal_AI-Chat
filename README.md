@@ -7,7 +7,7 @@ prerequisires
 
 """
 
-sudo pacman -Syu && sudo pacman -Sy konsole
+sudo pacman -Syu && sudo pacman -Sy konsole git wget curl
 
 git clone https://github.com/Zahnschmelz/gp_chat_shell.git
 
