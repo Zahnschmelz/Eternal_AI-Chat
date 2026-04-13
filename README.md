@@ -1,4 +1,4 @@
-# gp_chat_shell
+# eternal_chat
 general purpose chat shell (local LLM)
 
 interactive chat_shell to interact via pythons openai module with local LLMs like Ollama or lm-studio thrugh terminal, providing tool/function calling and simple tts/stt. (using arch)
