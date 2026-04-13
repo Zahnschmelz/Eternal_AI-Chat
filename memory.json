@@ -1,0 +1,7 @@
+{
+    "operating_system": "Arch Linux",
+    "name": "Alex",
+    "preferred_title": "Meister",
+    "pacman_install_flag": "--noconfirm",
+    "preferred_language": "Deutsch"
+}
