@@ -1,23 +1,16 @@
 # eternal_chat
 general purpose chat shell (local LLM)
 
-interactive chat_shell to interact via pythons openai module with local LLMs like Ollama or lm-studio thrugh terminal, providing tool/function calling and simple tts/stt. (using arch)
+interactive chat_shell to interact with local LLMs like lm-studio thrugh terminal, providing tool/function calling and auto summarize history.
 
 prerequisires 
 
-"""
+```
 
-sudo pacman -Syu && sudo pacman -Sy konsole git wget curl
+git clone https://github.com/Zahnschmelz/eternal_chat.git
 
-git clone https://github.com/Zahnschmelz/gp_chat_shell.git
+cd eternal_chat
+chmod +x run.sh
+./run.sh
 
-cd gp_chat_shell
-
-python -m venv venv
-
-source venv/bin/activate
-
-pip install -r requirements.txt && pip install -e .
-
-
-"""
+```
