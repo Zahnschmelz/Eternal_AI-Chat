@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import json
 from langchain_openai import ChatOpenAI
@@ -11,7 +12,7 @@ HISTORY_FILE = "chat_history.json"
 MEMORY_FILE = "memory.json"
 CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
-    "token_threshold": 2000,
+    "token_threshold": 5000,
     "base_url": "http://127.0.0.1:1994/v1",
     "api_key": "lm-studio"
 }
@@ -134,6 +135,127 @@ def bash_command(command: str) -> str:
     return "[Skipped bash_command]"
 
 # --- CHAT LOGIK ---
+
+def colorize_content(text: str) -> list:
+    """
+    Zerlegt den Text in Fragmente und weist Farben zu.
+    - Codeblocks (```python, ```bash, etc.): Cyan
+    - Tabellen (| ... |): Hellgrau/Blau zur Abhebung
+    - Header H1 (#): Braun
+    - Header H2 (##): Purple
+    - Header H3+ (###...): Orange + Zeilenumbruch
+    - Quotes (> ...): Dunkelgrau als zusammenhängender Block
+    - Alles andere: Standard
+    """
+    fragments = []
+    lines = text.split('\n')
+
+    in_code_block = False
+    current_block = []
+    current_color = RESET
+
+    in_table_block = False
+    table_color = "\033[37m" # Hellgrau für Tabellen
+
+    in_quote_block = False
+    quote_color = "\033[90m" # Dunkelgrau für Quotes
+
+    def flush_block(block_lines, color):
+        if not block_lines: return
+        content = "\n".join(block_lines)
+        fragments.append((content, color))
+
+    for line in lines:
+        stripped = line.strip()
+
+        # --- FALL 1: CODEBLOCK-LOGIK ---
+        if stripped.startswith("```"):
+            if not in_code_block:
+                in_code_block = True
+                lang = stripped.replace("```", "").strip().lower()
+                if lang in ["python", "bash", "sh", "shell", "javascript", "cpp", "sql"]:
+                    current_color = CYAN
+                else:
+                    current_color = RESET
+
+                first_line_content = line.replace("```", "").strip()
+                if first_line_content:
+                    current_block.append(first_line_content)
+            else:
+                last_line_content = line[:line.rfind("```")].strip()
+                if last_line_content:
+                    current_block.append(last_line_content)
+                flush_block(current_block, current_color)
+                current_block = []
+                in_code_block = False
+                fragments.append(("\n", RESET))
+            continue
+
+        if in_code_block:
+            current_block.append(line)
+            continue
+
+        # --- FALL 2: TABELLEN-LOGIK ---
+        is_table_line = stripped.startswith("|")
+        if is_table_line:
+            if not in_table_block:
+                in_table_block = True
+                current_block = [line]
+            else:
+                current_block.append(line)
+            continue
+        elif in_table_block:
+            flush_block(current_block, table_color)
+            current_block = []
+            in_table_block = False
+
+        # --- FALL 3: BLOCKQUOTE-LOGIK ---
+        is_quote_line = stripped.startswith(">")
+        if is_quote_line:
+            if not in_quote_block:
+                in_quote_block = True
+                current_block = [line]
+            else:
+                current_block.append(line)
+            continue
+        elif in_quote_block:
+            flush_block(current_block, quote_color)
+            current_block = []
+            in_quote_block = False
+
+        # --- FALL 4: HEADER-LOGIK (Erweitert für H1, H2, H3+) ---
+        # Wir zählen die Anzahl der '#' am Anfang
+        header_match = re.match(r'^(#+)\s(.*)', line)
+        if header_match:
+            hashes = header_match.group(1)
+            level = len(hashes)
+
+            if level == 1:
+                header_color = "\03int[38;5;94m" # Braun (Sienna/Brown)
+            elif level == 2:
+                header_color = "\033[38;5;135m" # Purple
+            else:
+                header_color = "\033[38;5;208m" # Orange für H3+
+
+            fragments.append((line, header_color))
+            fragments.append(("\n", RESET))
+            continue
+
+        # --- FALL 5: NORMALER TEXT ---
+        if line:
+            fragments.append((line, RESET))
+        else:
+            fragments.append(("\n", RESET))
+
+    # Cleanup am Ende des Loops
+    if in_code_block:
+        flush_block(current_block, current_color)
+    if in_table_block:
+        flush_block(current_block, table_color)
+    if in_quote_block:
+        flush_block(current_block, quote_color)
+
+    return fragments
 
 def summarize_history(history: list, model: ChatOpenAI) -> list:
     """
@@ -345,8 +467,16 @@ def chat_interface():
             response = agent.invoke({"messages": chat_history})
             assistant_content = response["messages"][-1].content
 
+            # LAYOUT-ÄNDERUNG: Zeilenumbruch nach "Assistant:" + Farbiges Rendering
             print(f"{RED}Assistant:{RESET}")
-            print(f"{assistant_content}\n")
+
+            fragments = colorize_content(assistant_content)
+            for text, color in fragments:
+                # Wir drucken das Fragment mit der zugeteilten Farbe
+                # WICHTIG: Wir nutzen end="" damit die Zeilenumbrüche im Text erhalten bleiben
+                print(f"{color}{text}{RESET}", end="")
+
+            print("\n") # Der abschließende Zeilenumbruch nach dem Block
 
             chat_history.append({"role": "assistant", "content": assistant_content})
             save_history(chat_history, HISTORY_FILE)
