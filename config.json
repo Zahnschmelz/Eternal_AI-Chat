@@ -1,5 +1,0 @@
-{
-  "api_key": "lm-studio",
-  "base_url": "http://localhost:1234/v1",
-  "token_threshold": 5000
-}
