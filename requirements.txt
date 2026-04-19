@@ -1,4 +1,5 @@
 openai
 rich
 tiktoken
-chromadb
+prompt_toolkit
+pygame
