@@ -3,6 +3,8 @@ import json
 import subprocess
 import datetime
 import tiktoken
+import base64
+import mimetypes
 from typing import List, Any, Dict, Union
 
 from openai import OpenAI
@@ -105,7 +107,8 @@ class HistoryManager:
 
     def add_message(self, role: str, content: Any, tool_calls: List[Dict] = None,
                     client: OpenAI = None, system_prompt: str = None, memories_text: str = ""):
-        msg = {"role": role, "content": str(content) if content else ""}
+        #msg = {"role": role, "content": str(content) if content else ""}
+        msg = {"role": role, "content": content if content else ""}
         if tool_calls:
             msg["tool_calls"] = tool_calls
         self.messages.append(msg)
@@ -130,7 +133,12 @@ class HistoryManager:
         for m in self.messages:
             role = m['role']
             content = m.get('content', '')
-            history_text += f"{role}: {string_content(content)}\n"
+            # Falls content eine Liste ist (Vision), extrahieren wir nur den Text
+            if isinstance(content, list):
+                text_part = "".join([item.get('text', '') if isinstance(item, dict) and item.get('type') == 'text' else "" for item in content])
+                history_text += f"{role}: {text_part}\n"
+            else:
+                history_text += f"{role}: {str(content)}\n"
 
         summary_prompt = (
             "Summarize the following conversation history into a concise summary. "
@@ -256,6 +264,22 @@ class ChatInterface:
     def tool_load_all_memory(self):
         return self.memory.get_all_formatted()
 
+    def tool_describe_image(self, path: str):
+        """Liest das Bild ein und gibt den Base64-String zurück, damit das Modell es 'sieht'."""
+        try:
+            if not os.path.exists(path):
+                return f"Error: File {path} not found."
+
+            mime_type, _ = mimetypes.guess_type(path)
+            if not mime_type or not mime_type.startswith("image/"):
+                return "Error: File is not a valid image."
+
+            with open(path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                return f"data:{mime_type};base64,{encoded_string}"
+        except Exception as e:
+            return f"Error reading image: {str(e)}"
+
     def execute_tool(self, tool_name, args):
         console.print(Panel(f"[bold cyan]Proposed Tool Call:[/bold cyan]\n{tool_name}({args})"))
         if not Confirm.ask("Allow execution?"):
@@ -267,6 +291,7 @@ class ChatInterface:
             if tool_name == "save_memory": return self.tool_save_memory(args['fact'])
             if tool_name == "get_memory": return self.tool_get_memory(args['query'])
             if tool_name == "load_all_memory": return self.tool_load_all_memory()
+            if tool_name == "describe_image": return self.tool_describe_image(args['path'])
             return "Unknown tool."
         except Exception as e:
             return f"Error: {str(e)}"
@@ -279,7 +304,8 @@ class ChatInterface:
             {"type": "function", "function": {"name": "write_file", "description": "Write a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
             {"type": "function", "function": {"name": "bash_command", "description": "Run bash", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
             {"type": "function", "function": {"name": "save_memory", "description": "Save fact", "parameters": {"type": "object", "properties": {"fact": {"type": "string"}}, "required": ["fact"]}}},
-            {"type": "function", "function": {"name": "load_all_memory", "description": "Load all", "parameters": {"type": "object", "properties": {}}}}
+            {"type": "function", "function": {"name": "load_all_memory", "description": "Load all", "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "describe_image", "description": "Read an image file and return its Base64 data so the model can see it.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
         ]
 
         while True:
@@ -362,8 +388,18 @@ class ChatInterface:
                             func_name = tc.function.name
                             args = json.loads(tc.function.arguments)
                             result = self.execute_tool(func_name, args)
-                            self.history.add_message("tool", result, client=self.client, system_prompt=sys_prompt, memories_text=memories_str)
-
+                            if func_name == "describe_image" and result.startswith("data:image/"):
+                                self.history.add_message("tool", f"Image loaded successfully from {args['path']}", client=self.client, system_prompt=sys_prompt, memories_text=memories_str)
+                                # Wir fügen eine neue User-Nachricht mit dem eigentlichen Bildinhalt hinzu
+                                self.history.messages.append({
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": f"Here is the image from the tool call: {args['path']}"},
+                                        {"type": "image_url", "image_url": {"url": result}}
+                                    ]
+                                })
+                            else:
+                                self.history.add_message("tool", result, client=self.client, system_prompt=sys_prompt, memories_text=memories_str)
                         continue
                     else:
                         ans = resp_msg.content or ""
