@@ -1,489 +1,383 @@
 import os
-import sys
 import json
-import time
 import subprocess
-import readline
+import datetime
 import tiktoken
-from datetime import datetime
+from typing import List, Any, Dict, Union
+
 from openai import OpenAI
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.prompt import Confirm
 
-# RAG Dependencies
-try:
-    import chromadb
-    from chromadb.config import Settings
-    HAS_CHROMA = True
-except ImportError:
-    HAS_CHROMA = False
+import pygame
+
+# --- Konfiguration & Dateipfade ---
+CONFIG_FILE = "config.json"
+HISTORY_FILE = "history.json"
+MEMORY_FILE = "memory.json"
+SOUND_FILE = "answer.mp3"
+
+console = Console()
 
 class Config:
-    def __init__(self, path='config.json'):
-        self.path = path
-        self.data = {
-            'token_threshold': 5000,
-            'url': 'http://localhost:1234/v1',
-            'port': 1234,
-            'temperature': 0.7,
-            'max_tokens': 8192,
-            'model': 'local-model'
+    def __init__(self):
+        self.defaults = {
+            "url": "http://localhost:1234/v1",
+            "api_key": "lm-studio",
+            "temperature": 0.7,
+            "token_threshold": 5000,
+            "model": "model-identifier"
         }
-        self.load()
+        self.data = self.load()
 
     def load(self):
-        if os.path.exists(self.path):
-            with open(self.path, 'r') as f:
-                try:
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r') as f:
                     loaded = json.load(f)
-                    self.data.update(loaded)
-                except json.JSONDecodeError:
-                    pass
-        else:
-            self.save()
+                    return {**self.run_defaults(), **loaded} # Fix logic
+            except Exception:
+                return self.defaults
+        return self.defaults
+
+    def run_defaults(self):
+        return self.defaults
 
     def save(self):
-        with open(self.path, 'w') as f:
-            json.dump(self.data, f, indent=2)
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.data, f, indent=4)
 
-    def get(self, key, default=None):
-        return self.data.get(key, default)
-
-    def set(self, key, value):
+    def update(self, key, value):
         self.data[key] = value
         self.save()
 
 class MemoryManager:
-    def __init__(self):
-        if not HAS_CHROMA:
-            print("Warning: ChromaDB not installed. RAG features disabled.")
+    def __init__(self, path):
+        self.path = path
+        self.memory = self.load()
+
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, 'r') as f:
+                    return json.load(f)
+            except:
+                return []
+        return []
+
+    def save(self):
+        with open(self.path, 'w') as f:
+            json.dump(self.memory, f, indent=4)
+
+    def add(self, fact: str):
+        self.memory.append({"fact": fact})
+        self.save()
+
+    def get_all_formatted(self):
+        if not self.memory:
+            return "Memory is empty."
+        lines = [f"{m.get('fact', '')}" for m
+                 in self.memory]
+        return "\n".join(lines)
+
+class HistoryManager:
+    def __init__(self, path, config: Config):
+        self.path = path
+        self.config = config
+        self.messages = self.load()
+
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, 'r') as f:
+                    return json.load(f)
+            except:
+                return []
+        return []
+
+    def save(self):
+        with open(self.path, 'w') as f:
+            json.dump(self.messages, f, indent=4)
+
+    def add_message(self, role: str, content: Any, tool_calls: List[Dict] = None,
+                    client: OpenAI = None, system_prompt: str = None, memories_text: str = ""):
+        msg = {"role": role, "content": str(content) if content else ""}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        self.messages.append(msg)
+        self.save()
+
+        if client and system_prompt:
+            self.check_buffer_summary(client, system_prompt, memories_text)
+
+    def check_buffer_summary(self, client: OpenAI, system_prompt: str, memories_text: str):
+        total = self.get_total_tokens()
+        threshold = self.config.data['token_threshold']
+
+        if total > threshold and len(self.messages) > 4:
+            console.print("[yellow]Token limit reached. Summarizing history via LLM...[/yellow]")
+            self.shrink(client, system_prompt, memories_text)
+
+    def shrink(self, client: OpenAI, system_prompt: str, memories_text: str):
+        if len(self.messages) <= 1:
             return
-        try:
-            self.client = chromadb.PersistentClient(path="./rag_memory")
-            self.collection = self.client.get_or_create_collection(name="user_facts")
-        except Exception as e:
-            print(f"Error initializing RAG: {e}")
-            self.client = None
 
-    def save_memory(self, content):
-        if not self.client:
-            return "RAG not available."
+        history_text = ""
+        for m in self.messages:
+            role = m['role']
+            content = m.get('content', '')
+            history_text += f"{role}: {string_content(content)}\n"
+
+        summary_prompt = (
+            "Summarize the following conversation history into a concise summary. "
+            "The summary should be informative but brief, aiming for around 1000 tokens maximum. "
+            "Focus on key facts, decisions, and context.\n\n"
+            f"History:\n{history_text}"
+        )
+
         try:
-            # Simple embedding using a dummy method or relying on Chroma's default if installed with transformers
-            # For this script, we assume chromadb has a default embedding function or we use a placeholder
-            # In a real env, one might need to install sentence-transformers.
-            # Here we rely on Chroma's default behavior.
-            self.collection.add(
-                documents=[content],
-                ids=[str(int(time.time()))]
+            response = client.chat.completions.create(
+                model=self.config.data['model'],
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that summarizes conversations."},
+                    {"role": "user", "content": summary_prompt}
+                ]
             )
-            return "Memory saved."
-        except Exception as e:
-            return f"Error saving memory: {e}"
+            summary_text = response.choices[0].message.content
 
-    def load_memory(self, query):
-        if not self.client:
-            return "RAG not available."
-        try:
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=5
-            )
-            return "\n".join(results['documents'][0]) if results['documents'][0] else "No memories found."
-        except Exception as e:
-            return f"Error loading memory: {e}"
+            keep_messages = self.messages[-2:]
+            self.messages = [
+                {"role": "system", "content": f"Summary of previous conversation: {summary_text}"},
+                {"role": "system", "content": f"Long-term Memories:\n{memories_text}"}
+            ] + keep_messages
 
-    def load_all_memory(self):
-        if not self.client:
-            return "RAG not available."
-        try:
-            results = self.collection.get()
-            return "\n".join(results['documents']) if results['documents'] else "No memories found."
+            self.save()
+            console.print("[green]History summarized and memories re-attached.[/green]")
         except Exception as e:
-            return f"Error loading all memory: {e}"
+            console.print(f"[red]Failed to summarize history: {str(perm_error(e))}[/red]")
+
+    def clear(self):
+        self.messages = []
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def count_tokens(self, text: str):
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except:
+            return len(text) // 4
+
+    def get_total_tokens(self):
+        total = 0
+        for m in self.messages:
+            if isinstance(m, dict) and 'content' in m:
+                total += self.count_tokens(m['content'])
+        return total
+
+# Helper functions for the error handling logic used above
+def string_content(c): return str(c)
+def perm_error(e): return str(e)
+
+class CommandCompleter(Completer):
+    def get_completions(self, document, complete, *args):
+        text = document.text
+        if not text.startswith('/'):
+            return
+        commands = ['/exit', '/clear', '/history', '/memory', '/shrink', '/threshold', '/tools', '/tokens', '/config', '/url', '/help']
+        for cmd in commands:
+            if cmd.startswith(text):
+                yield Completion(cmd, start_position=-len(text))
 
 class ChatInterface:
     def __init__(self):
+        try:
+            print("HUI")
+            pygame.mixer.init()
+            self.sound_available = os.path.exists(SOUND_FILE)
+            if not self.sound_available:
+                console.print(f"[yellow]Warning: {SOUND_FILE} not found.[/yellow]")
+        except Exception as e:
+            console.print(f"[red]Sound error: {e}[/red]")
+            self.sound_available = False
+
+        os.system('clear')
+
         self.config = Config()
-        self.memory = MemoryManager()
-        self.client = OpenAI(
-            base_url=self.config.get('url', 'http://localhost:1234/v1'),
-            api_key="lm-studio" # LMStudio often uses a dummy key or empty
-        )
-        self.history_file = "chat_history.json"
-        self.history = []
-        self.messages = [] # Raw messages for API
-        self.token_count = 0
-        self.load_history()
-        self.setup_readline()
+        self.memory = MemoryManager(MEMORY_FILE)
+        self.history = HistoryManager(HISTORY_FILE, self.config)
+        self.client = OpenAI(base_url=self.config.data['url'], api_key=self.config.data['api_key'])
+        self.session = PromptSession(completer=CommandCompleter())
 
-    def load_history(self):
-        if os.path.exists(self.history_file):
-            with open(self.history_file, 'r') as f:
-                try:
-                    self.history = json.load(f)
-                    # Reconstruct messages list for API usage
-                    self.messages = [msg for msg in self.history if msg.get('role') in ['system', 'user', 'assistant']]
-                except json.JSONDecodeError:
-                    self.history = []
-                    self.messages = []
-        else:
-            self.history = []
-            self.messages = []
-
-    def save_history(self):
-        # Save the current history state
-        with open(self.history_file, 'w') as f:
-            json.dump(self.history, f, indent=2)
-
-    def setup_readline(self):
-        completer = readline.get_completer()
-        readline.set_completer(self.complete)
-        readline.parse_and_bind("tab: complete")
-
-    def complete(self, text, state):
-        if text.startswith("/"):
-            commands = ["exit", "clear", "history", "memory", "messages", "shrink", "threshold", "tools", "tokens", "config", "url", "help"]
-            return [cmd for cmd in commands if cmd.startswith(text[1:])][state]
-        return None
+    def play_answer_sound(self):
+        if self.sound_available:
+            try:
+                pygame.mixer.music.load(SOUND_FILE)
+                pygame.mixer.music.play()
+            except Exception:
+                pass
 
     def get_system_prompt(self):
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        prompt = f'''You are a professional system assistant.
-"You can read/write files, run bash commands, and manage a long-term memory. "
-"If the user asks to see or load all memories, use 'load_all_memory'. "
-"If the user tells you a fact about themselves or the system, use 'save_memory' to remember it. "
-"If you need to recall a known fact, use 'get_memory'. "
-"Don't just make things up. "
-"Use the available tools if they help you solve a problem. "
-"Work efficiently by chaining commands together. "
-"Always provide clear and professional answers. "
-"Load all memory entries if you're missing information. "
-Current Date & Time: {now}'''
-        return prompt
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            "You are a professional system assistant. "
+            "You can read/write files, run bash commands, and manage a long-term memory. "
+            "If the user tells you a fact about themselves or the system, use 'save_memory' to remember it. "
+            "If you need to recall a known fact, use 'load_all_memory'. "
+            "Don't just make things up. "
+            "Use the available tools if they help you solve a problem. "
+            "Work efficiently by chaining commands together. "
+            "Always provide clear and professional answers. "
+            f"\n\nCurrent Date/Time: {now}"
+        )
 
-    def count_tokens(self, messages):
-        try:
-            encoding = tiktoken.encoding_for_model("gpt-4")
-            token_count = 0
-            for msg in messages:
-                token_count += len(encoding.encode(json.dumps(msg['content']))) + 4
-            return token_count
-        except Exception:
-            return sum(len(str(m['content'])) for m in messages)
+    # --- Tools ---
+    def tool_read_file(self, path: str):
+        with open(path, 'r', encoding='utf-8') as f: return f.read()
 
-    def summarize_history(self):
-        # Use the model to summarize older parts of the history if it gets too long
-        # We keep the last 2 messages and summarize the rest
-        if len(self.messages) < 5:
-            return self.messages
-        
-        # Prepare a summary prompt
-        system_msg = {"role": "system", "content": "Summarize the following conversation history concisely, focusing on key facts and context. Keep it under 1000 tokens."}
-        older_msgs = self.messages[:-2] # Keep last 2
-        
-        # Format older messages for summarization
-        summary_input = "\n".join([f"{m['role']}: {m['content']}" for m in older_msgs])
-        
+    def tool_write_file(self, path: str, content: str):
+        with open(path, 'w', encoding='utf-8') as f: f.write(content)
+        return f"File {path} written."
+
+    def tool_bash_command(self, command: str):
         try:
-            response = self.client.chat.completions.create(
-                model=self.config.get('model', 'local-model'),
-                messages=[system_msg, {"role": "user", "content": f"Summarize this:\n{summary_input}"}],
-                temperature=0.3
-            )
-            summary_text = response.choices[0].message.content
-            # Replace older messages with summary
-            self.messages = [
-                {"role": "system", "content": self.get_system_prompt()},
-                {"role": "user", "content": f"[Previous conversation summarized: {summary_text}]\n"}
-            ] + self.messages[-2:]
-            
-            # Update history file to reflect this change? 
-            # For simplicity, we just update the in-memory messages. 
-            # The user asked to save history, so we should probably save the summarized version too.
-            self.history = [{"role": "system", "content": self.get_system_prompt()}, 
-                            {"role": "user", "content": f"[Previous conversation summarized: {summary_text}]\n"}] + self.history[-2:]
-            return True
+            return subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT, text=True)
+        except subprocess.CalledProcessError as e:
+            return f"Error: {e.output}"
+
+    def tool_save_memory(self, fact: str):
+        self.memory.add(fact)
+        return "Fact saved."
+
+    def tool_load_all_memory(self):
+        return self.memory.get_all_formatted()
+
+    def execute_tool(self, tool_name, args):
+        console.print(Panel(f"[bold cyan]Proposed Tool Call:[/bold cyan]\n{tool_name}({args})"))
+        if not Confirm.ask("Allow execution?"):
+            return "Denied."
+        try:
+            if tool_name == "read_file": return self.tool_read_file(args['path'])
+            if tool_name == "write_file": return self.tool_write_file(args['path'], args['content'])
+            if tool_name == "bash_command": return self.tool_bash_command(args['command'])
+            if tool_name == "save_memory": return self.tool_save_memory(args['fact'])
+            if tool_name == "get_memory": return self.tool_get_memory(args['query'])
+            if tool_name == "load_all_memory": return self.tool_load_all_memory()
+            return "Unknown tool."
         except Exception as e:
-            print(f"Error summarizing: {e}")
-            return False
-
-    def execute_tool(self, tool_call):
-        func_name = tool_call.function.name
-        arguments = json.loads(tool_call.function.arguments)
-        
-        # Human in the loop
-        print(f"\nTool Call Detected: {func_name}({arguments})")
-        confirm = input("Execute? (y/n): ").strip().lower()
-        if confirm != 'y':
-            return None
-
-        result = ""
-        if func_name == "read_file":
-            filepath = arguments.get('file_path')
-            if os.path.exists(filepath):
-                with open(filepath, 'r') as f:
-                    result = f.read()
-            else:
-                result = "File not found."
-        elif func_name == "write_file":
-            filepath = arguments.get('file_path')
-            content = arguments.get('content')
-            try:
-                with open(filepath, 'w') as f:
-                    f.write(content)
-                result = f"File written to {filepath}."
-            except Exception as e:
-                result = f"Error writing file: {e}"
-        elif func_name == "bash_command":
-            cmd = arguments.get('command')
-            try:
-                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                result = proc.stdout + proc.stderr
-            except Exception as e:
-                result = f"Error executing command: {e}"
-        elif func_name == "save_memory":
-            content = arguments.get('content')
-            result = self.memory.save_memory(content)
-        elif func_name == "get_memory":
-            query = arguments.get('query')
-            result = self.memory.load_memory(query)
-        elif func_name == "load_all_memory":
-            result = self.memory.load_all_memory()
-        
-        return result
-
-    def process_tools(self, tool_calls):
-        tool_results = []
-        for tc in tool_calls:
-            res = self.execute_tool(tc)
-            if res is not None:
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": res
-                })
-        return tool_results
+            return f"Error: {str(e)}"
 
     def run(self):
-        print("Chat Interface Started. Type /help for commands.")
-        
+        console.print(Panel("[bold green]Eternal_AI-Chat Started[/bold green]\nType /help for commands."))
+
+        tools_definition = [
+            {"type": "function", "function": {"name": "read_file", "description": "Read a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+            {"type": "function", "function": {"name": "write_file", "description": "Write a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+            {"type": "function", "function": {"name": "bash_command", "description": "Run bash", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+            {"type": "function", "function": {"name": "save_memory", "description": "Save fact", "parameters": {"type": "object", "properties": {"fact": {"type": "string"}}, "required": ["fact"]}}},
+            {"type": "function", "function": {"name": "load_all_memory", "description": "Load all", "parameters": {"type": "object", "properties": {}}}}
+        ]
+
         while True:
             try:
-                user_input = input("User: ").strip()
-            except EOFError:
-                break
-            
-            if not user_input:
-                continue
+                user_input = self.session.prompt("\n>> ")
+                if not user_input: continue
 
-            # Handle commands
-            if user_input.startswith("/"):
-                parts = user_input.split()
-                cmd = parts[0].lower()
-                
-                if cmd == "/exit":
-                    print("Exiting...")
-                    break
-                elif cmd == "/clear":
-                    self.messages = []
-                    self.history = []
-                    self.save_history()
-                    print("History cleared.")
-                elif cmd == "/history":
-                    print(json.dumps(self.history, indent=2))
-                elif cmd == "/memory":
-                    print(self.memory.load_all_memory())
-                elif cmd == "/messages":
-                    print(json.dumps(self.messages, indent=2))
-                elif cmd == "/shrink":
-                    self.summarize_history()
-                    self.save_history()
-                    print("History summarized and saved.")
-                elif cmd == "/threshold":
-                    if len(parts) > 1:
-                        try:
-                            val = int(parts[1])
-                            self.config.set('token_threshold', val)
-                            print(f"Threshold set to {val}.")
-                        except ValueError:
-                            print("Invalid number.")
-                    else:
-                        print("Usage: /threshold <n>")
-                elif cmd == "/tools":
-                    print("Available tools: read_file, write_file, bash_command, save_memory, get_memory, load_all_memory")
-                elif cmd == "/tokens":
-                    count = self.count_tokens(self.messages)
-                    print(f"Current token count: {count}")
-                elif cmd == "/config":
-                    print(json.dumps(self.config.data, indent=2))
-                elif cmd == "/url":
-                    if len(parts) > 1:
-                        self.config.set('url', parts[1])
-                        self.client = OpenAI(base_url=self.config.get('url'), api_key="lm-studio")
-                        print(f"URL set to {parts[1]}")
-                elif cmd == "/help":
-                    print("""/exit - Beendet die Session.
-/clear - Löscht die aktuelle Chat-Historie.
-/history - Zeigt die aktuelle Historie an.
-/memory - Zeigt alle gespeicherten Fakten an.
-/messages - zeigt Inhalt von messages variable
-/shrink - Komprimiert die Historie manuell.
-/threshold <n> - Setzt das Token-Limit auf <n>.
-/tools - Zeigt alle verfügbaren Tools an.
-/tokens - Zeigt die aktuelle Tokenanzahl an.
-/config - Zeigt die aktuelle config an.
-/url - Setzt die Connection-URL.
-/help - Zeigt diese Hilfe an.""")
-                else:
-                    print(f"Unknown command: {cmd}")
-                continue
+                sys_prompt = self.get_system_prompt()
+                memories_str = self.memory.get_all_formatted()
 
-            # Add user message to history
-            user_msg = {"role": "user", "content": user_input}
-            self.messages.append(user_msg)
-            self.history.append(user_msg)
-            self.save_history()
+                if user_input.startswith('/'):
+                    parts = user_input.split(' ', 1)
+                    cmd = parts[0]
+                    arg = parts[1] if len(parts) > 1 else None
+                    if cmd == '/exit': break
+                    elif cmd == '/clear': self.history.clear(); console.print("Cleared.")
+                    elif cmd == '/memory': console.print(Panel(self.memory.get_all_formatted(), title="Memory"))
+                    elif cmd == '/tokens': console.print(f"Tokens: {self.history.get_total_tokens()}")
+                    elif cmd == '/config': console.print(self.config.data)
+                    elif cmd == '/shrink': self.history.shrink(self.client, sys_prompt, memories_str)
+                    elif cmd == '/url' and arg:
+                        self.config.update('url', arg)
+                        self.client = OpenAI(base_url=arg, api_key=self.config.data['api_key'])
+                    elif cmd == '/history':
+                        if not self.history.messages:
+                            console.print("History is empty.")
+                        else:
+                            for msg in self.history.messages:
+                                role = msg['role']
+                                content = msg.get('content', '')
+                                console.print(f"[{role}]: {content}")
+                    elif cmd == '/threshold':
+                        console.print(f"Token Threshold: {self.config.data['token_threshold']}")
+                    elif cmd == '/tools':
+                        console.print(Panel(json.dumps(self.tools_definition, indent=2), title="Available Tools"))
+                    elif cmd == '/help':
+                        help_text = (
+                            "/exit - Exit the chat\n"
+                            "/clear - Clear chat history\n"
+                            "/history - Show chat history\n"
+                            "/memory - Show long-term memory\n"
+                            "/shrink - Summarize history\n"
+                            "/threshold - Show token threshold\n"
+                            "/tools - Show available tools\n"
+                            "/tokens - Show current token count\n"
+                            "/config - Show configuration\n"
+                            "/url <url> - Update API URL\n"
+                            "/help - Show this help message"
+                        )
+                        console.print(Panel(help_text, title="Help Menu"))
+                    continue
 
-            # Check token limit and summarize if needed
-            current_tokens = self.count_tokens(self.messages)
-            threshold = self.config.get('token_threshold', 5000)
-            if current_tokens > threshold:
-                print("Token limit reached. Summarizing history...")
-                self.summarize_history()
+                print()
 
-            # Build prompt with system message
-            sys_prompt = self.get_system_prompt()
-            api_messages = [{"role": "system", "content": sys_prompt}] + self.messages
+                self.history.add_message("user", user_input, client=self.client, system_prompt=sys_prompt, memories_text=memories_str)
 
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.config.get('model', 'local-model'),
-                    messages=api_messages,
-                    temperature=self.config.get('temperature', 0.7),
-                    max_tokens=self.config.get('max_tokens', 8192),
-                    tools=[
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "description": "Reads the content of a file.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "file_path": {"type": "string", "description": "Path to the file"}
-                                    },
-                                    "required": ["file_path"]
-                                }
-                            }
-                        },
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "write_file",
-                                "description": "Writes content to a file.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "file_path": {"type": "string", "description": "Path to the file"},
-                                        "content": {"type": "string", "description": "Content to write"}
-                                    },
-                                    "required": ["file_path", "content"]
-                                }
-                            }
-                        },
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "bash_command",
-                                "description": "Executes a bash command.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "command": {"type": "string", "description": "The bash command to execute"}
-                                    },
-                                    "required": ["command"]
-                                }
-                            }
-                        },
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "save_memory",
-                                "description": "Saves a fact to long-term memory.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "content": {"type": "string", "description": "The fact to save"}
-                                    },
-                                    "required": ["content"]
-                                }
-                            }
-                        },
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "get_memory",
-                                "description": "Retrieves memories based on a query.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "query": {"type": "string", "description": "Search query"}
-                                    },
-                                    "required": ["query"]
-                                }
-                            }
-                        },
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "load_all_memory",
-                                "description": "Loads all saved memories.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {}
-                                }
-                            }
-                        }
-                    ],
-                    tool_choice="auto"
-                )
+                while True:
+                    api_messages = [{"role": "system", "content": sys_prompt}] + self.history.messages
 
-                assistant_msg = response.choices[0].message
-                
-                # Handle tool calls
-                if assistant_msg.tool_calls:
-                    tool_results = self.process_tools(assistant_msg.tool_calls)
-                    # Add tool results to messages
-                    for tr in tool_results:
-                        self.messages.append(tr)
-                    
-                    # Call API again with tool results
-                    response2 = self.client.chat.completions.create(
-                        model=self.config.get('model', 'local-model'),
-                        messages=api_messages + [{"role": "assistant", "tool_calls": assistant_msg.tool_calls}] + tool_results,
-                        temperature=self.config.get('temperature', 0.7),
-                        max_tokens=self.config.get('max_tokens', 8192)
+                    response = self.client.chat.completions.create(
+                        model=self.config.data['model'],
+                        messages=api_messages,
+                        tools=tools_definition,
+                        temperature=self.config.data['temperature']
                     )
-                    final_assistant_msg = response2.choices[0].message
-                else:
-                    final_assistant_msg = assistant_msg
 
-                # Format response with Rich
-                if final_assistant_msg.content:
-                    console = Console()
-                    console.print(Panel(Markdown(final_assistant_msg.content), title="Assistant"))
-                
-                # Add assistant message to history
-                asst_history_msg = {"role": "assistant", "content": final_assistant_msg.content}
-                self.messages.append(asst_history_msg)
-                self.history.append(asst_history_msg)
-                self.save_history()
+                    resp_msg = response.choices[0].message
+
+                    if resp_msg.tool_calls:
+                        tc_list = []
+                        for tc in resp_msg.tool_calls:
+                            tc_list.append({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                            })
+                        self.history.add_message("assistant", resp_msg.content or "", tool_calls=tc_list, client=self.client, system_prompt=sys_prompt, memories_text=memories_str)
+
+                        for tc in resp_msg.tool_calls:
+                            func_name = tc.function.name
+                            args = json.loads(tc.function.arguments)
+                            result = self.execute_tool(func_name, args)
+                            self.history.add_message("tool", result, client=self.client, system_prompt=sys_prompt, memories_text=memories_str)
+
+                        continue
+                    else:
+                        ans = resp_msg.content or ""
+                        self.history.add_message("assistant", ans, client=self.client, system_prompt=sys_prompt, memories_text=memories_str)
+                        console.print(Markdown(ans))
+                        self.play_answer_control(ans)
+                        break
 
             except Exception as e:
-                print(f"Error: {e}")
+                console.print(f"[bold red]Error:[/bold red] {str(e)}")
+
+    def play_answer_control(self, ans):
+        self.play_answer_sound()
 
 if __name__ == "__main__":
-    app = ChatInterface()
-    app.run()
+    chat = ChatInterface()
+    chat.run()
