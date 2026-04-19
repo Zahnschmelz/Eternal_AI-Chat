@@ -195,15 +195,15 @@ class HistoryManager:
 def string_content(c): return str(c)
 def perm_error(e): return str(e)
 
-#class CommandCompleter(Completer):
-#    def get_completions(self, document, complete, *args):
-#        text = document.text
-#        if not text.startswith('/'):
-#            return
-#        commands = ['/exit', '/clear', '/history', '/memory', '/shrink', '/threshold', '/tools', '/tokens', '/config', '/url', '/help']
-#        for cmd in commands:
-#            if cmd.startswith(text):
-#                yield Completion(cmd, start_position=-len(text))
+class CommandCompleter(Completer):
+    def get_completions(self, document, complete, *args):
+        text = document.text
+        if not text.startswith('/'):
+            return
+        commands = ['/exit', '/clear', '/history', '/memory', '/shrink', '/threshold', '/tools', '/tokens', '/config', '/url', '/help']
+        for cmd in commands:
+            if cmd.startswith(text):
+                yield Completion(cmd, start_position=-len(text))
 
 class ChatInterface:
     def __init__(self):
@@ -318,12 +318,12 @@ class ChatInterface:
                 #user_input = self.session.prompt(">> ")
 
                 commands = ["/exit", "/clear", "/history", "/memory", "/shrink", "/threshold", "/tools", "/tokens", "/config", "/url", "/help"]
-                completer = WordCompleter(commands)
+                completer = CommandCompleter()
                 session = PromptSession()
                 custom_style = Style.from_dict({'prompt_color': 'cyan'})
 
                 user_input = session.prompt(
-                    HTML('<prompt_color>> </prompt_color>'),
+                    HTML('<prompt_color>>> </prompt_color>'),
                     completer=completer,
                     style=custom_style
                 ).strip()
