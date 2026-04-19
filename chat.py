@@ -9,11 +9,15 @@ from typing import List, Any, Dict, Union
 
 from openai import OpenAI
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.completion import Completer, Completion, WordCompleter
+from prompt_toolkit.styles import Style
+from prompt_toolkit.formatted_text import HTML
+
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
+
 
 import pygame
 
@@ -191,15 +195,15 @@ class HistoryManager:
 def string_content(c): return str(c)
 def perm_error(e): return str(e)
 
-class CommandCompleter(Completer):
-    def get_completions(self, document, complete, *args):
-        text = document.text
-        if not text.startswith('/'):
-            return
-        commands = ['/exit', '/clear', '/history', '/memory', '/shrink', '/threshold', '/tools', '/tokens', '/config', '/url', '/help']
-        for cmd in commands:
-            if cmd.startswith(text):
-                yield Completion(cmd, start_position=-len(text))
+#class CommandCompleter(Completer):
+#    def get_completions(self, document, complete, *args):
+#        text = document.text
+#        if not text.startswith('/'):
+#            return
+#        commands = ['/exit', '/clear', '/history', '/memory', '/shrink', '/threshold', '/tools', '/tokens', '/config', '/url', '/help']
+#        for cmd in commands:
+#            if cmd.startswith(text):
+#                yield Completion(cmd, start_position=-len(text))
 
 class ChatInterface:
     def __init__(self):
@@ -219,7 +223,7 @@ class ChatInterface:
         self.memory = MemoryManager(MEMORY_FILE)
         self.history = HistoryManager(HISTORY_FILE, self.config)
         self.client = OpenAI(base_url=self.config.data['url'], api_key=self.config.data['api_key'])
-        self.session = PromptSession(completer=CommandCompleter())
+        #self.session = PromptSession(completer=CommandCompleter())
 
     def play_answer_sound(self):
         if self.sound_available:
@@ -310,7 +314,19 @@ class ChatInterface:
 
         while True:
             try:
-                user_input = self.session.prompt("\n>> ")
+                print()
+                #user_input = self.session.prompt(">> ")
+
+                commands = ["/exit", "/clear", "/history", "/memory", "/shrink", "/threshold", "/tools", "/tokens", "/config", "/url", "/help"]
+                completer = WordCompleter(commands)
+                session = PromptSession()
+                custom_style = Style.from_dict({'prompt_color': 'cyan'})
+
+                user_input = session.prompt(
+                    HTML('<prompt_color>> </prompt_color>'),
+                    completer=completer,
+                    style=custom_style
+                ).strip()
                 if not user_input: continue
 
                 sys_prompt = self.get_system_prompt()
