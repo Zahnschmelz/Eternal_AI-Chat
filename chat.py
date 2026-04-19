@@ -420,7 +420,8 @@ class ChatInterface:
                     else:
                         ans = resp_msg.content or ""
                         self.history.add_message("assistant", ans, client=self.client, system_prompt=sys_prompt, memories_text=memories_str)
-                        console.print(Markdown(ans))
+                        #console.print(Markdown(ans))
+                        console.print(Panel(Markdown(ans), title="Assistant", border_style="green"))
                         self.play_answer_control(ans)
                         break
 
